@@ -7,9 +7,9 @@ $ cd PyTorch-YOLOv3/
 $ sudo pip3 install -r requirements.txt  
 
 # Install Nvidia/apex  
-https://zhuanlan.zhihu.com/p/146515828
-git clone https://github.com/NVIDIA/apex
-cd apex
+https://zhuanlan.zhihu.com/p/146515828  
+git clone https://github.com/NVIDIA/apex  
+cd apex  
 python3 setup.py install
 
 # Train
