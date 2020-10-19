@@ -289,11 +289,13 @@ def wh_iou(wh1, wh2):
     return inter / (wh1.prod(2) + wh2.prod(2) - inter)  # iou = inter / (area1 + area2 - inter)
 
 class GHMC_loss(nn.Module):
-    def __init__(self, bins=10):
+    def __init__(self, ghm, bins=10, reduction='mean'):
         super(GHMC_loss, self).__init__()
         self.bins = bins
         self.edges = [float(x) / bins for x in range(bins + 1)]
         self.edges[-1] += 1e-6
+        self.ghm = ghm
+        self.reduction = reduction
 
     def forward(self, pred, target):
         target = target.float()
@@ -309,9 +311,9 @@ class GHMC_loss(nn.Module):
             inds = (g >= edges[i]) & (g <= edges[i + 1])
             num_in_bins = inds.sum().item()
             if num_in_bins > 0:
-                weights[inds] = total / num_in_bins
+                weights[inds] = self.ghm * (total / num_in_bins)
         weights = weights / 10
-        loss = F.binary_cross_entropy_with_logits(pred, target, weight=weights)
+        loss = F.binary_cross_entropy_with_logits(pred, target, weight=weights,reduction=self.reduction)
         return loss
 
 
@@ -365,7 +367,7 @@ def compute_loss(p, targets, model):  # predictions, targets, model
 
     g = h['ghm']
     if g > 0:
-        BCEobj = GHMC_loss()
+        BCEobj = GHMC_loss(ghm=g, reduction=red)
     else:
         g = h['fl_gamma']  # focal loss gamma
         if g > 0:
