@@ -1,189 +1,348 @@
 import argparse
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+import torch.optim as optim
+import test
 from models import *
 from utils.datasets import *
 from utils.utils import *
+mixed_precision = True
+try:  # Mixed precision
+    from apex import amp
+except:
+    mixed_precision = False
 
+# os.sep根据你所处的平台，自动采用相应的分隔符号
+wdir = 'weights' + os.sep
+last = wdir + 'last.pt'
+best = wdir + 'best.pt'
+results_file = 'results.txt'
+# 超参数
+hyp = {'giou': 3.50,            # giou loss gain
+       'cls': 37.4,             # cls loss gain
+       'cls_pw': 1.0,           # cls BCELoss positive_weight
+       'obj': 34.5,             # obj loss gain
+       'obj_pw': 1.0,           # obj BCELoss positive_weight
+       'iou_t': 0.215,          # iou training threshold
+       'lr': 0.001,             # initial learning rate (SGD=5E-3, Adam=5E-4)
+       'momentum': 0.9,         # SGD momentum
+       'weight_decay': 0.0005,  # optimizer weight decay
+       'fl_gamma': 0.0,         # focal loss gamma (efficientDet default is gamma=1.5)
+       'hsv_h': 0.0138,         # image HSV-Hue augmentation (fraction)
+       'hsv_s': 0.678,          # image HSV-Saturation augmentation (fraction)
+       'hsv_v': 0.20,           # image HSV-Value augmentation (fraction)
+       'degrees': 1.98 * 0,     # image rotation (+/- deg)
+       'translate': 0.05 * 0,   # image translation (+/- fraction)
+       'scale': 0.05 * 0,       # image scale (+/- gain)
+       'shear': 0.641 * 0,      # image shear (+/- deg)
+       }
 
-def test(cfg,
-         data,
-         weights=None,
-         batch_size=8,
-         imgsz=416,
-         conf_thres=0.25,
-         iou_thres=0.5,  # for nms
-         model=None,
-         dataloader=None,
-         multi_label=True):
-    # Initialize/load model and set device
-    if model is None:
-        is_training = False
-        device = torch_utils.select_device(opt.device)
+def train(hyp):
+    cfg = opt.cfg
+    data = opt.data
+    epochs = opt.epochs
+    batch_size = opt.batch_size
+    accumulate = max(round(64 / batch_size), 1)  # accumulate n times before optimizer update (bs 64)
+    weights = opt.weights  # initial training weights
+    img_size = opt.img_size  # img sizes
+    imgsz_test = opt.img_size
 
-        # Remove previous
-        for f in glob.glob('test_batch*.jpg'):
-            os.remove(f)
-
-        # Initialize model
-        model = Darknet(cfg, imgsz)
-
-        # Load weight
-        if weights.endswith('.pt'):  # pytorch format
-            model.load_state_dict(torch.load(weights, map_location=device)['model'])
-        else:  # darknet format
-            load_darknet_weights(model, weights)
-
-        # Fuse
-        #model.fuse()
-        model.to(device)
-
-        if device.type != 'cpu' and torch.cuda.device_count() > 1:
-            model = nn.DataParallel(model)
-    else:  # called by train.py
-        is_training = True
-        device = next(model.parameters()).device  # get model device
+    # Image Sizes
+    gs = 32  # 32倍降采样
+    assert math.fmod(img_size, gs) == 0, '--img-size %g must be a %g-multiple' % (img_size, gs)  # fmod(x,y)取x/y的余数
+    # 多尺度训练
+    if opt.multi_scale:
+        imgsz_min = round(img_size / 32 / 1.5) + 1
+        imgsz_max = round(img_size / 32 * 1.5) - 1
+        img_size = imgsz_max * 32  # initialize with max size
+        print('Using multi-scale %g - %g' % (imgsz_min * 32, img_size))
 
     # Configure run
-    data = parse_data_cfg(data)
-    nc = int(data['classes'])  # number of classes
-    path = data['valid']  # path to test images
-    names = load_classes(data['names'])  # class names
-    iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
-    iouv = iouv[0].view(1)  # comment for mAP@0.5:0.95
-    niou = iouv.numel()
+    init_seeds()
+    # 解析data文件
+    data_dict = parse_data_cfg(data)
+    train_path = data_dict['train']
+    test_path = data_dict['valid']
+    # number of classes
+    nc = int(data_dict['classes'])
+    # Remove previous results
+    for f in glob.glob('*_batch*.jpg') + glob.glob(results_file):
+        os.remove(f)
 
-    # Dataloader
-    if dataloader is None:
-        dataset = LoadImagesAndLabels(path, imgsz, batch_size, rect=True, pad=0.5)
-        batch_size = min(batch_size, len(dataset))
-        dataloader = DataLoader(dataset,
-                                batch_size=batch_size,
-                                num_workers=min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8]),
-                                pin_memory=True,
-                                collate_fn=dataset.collate_fn)
-    seen = 0
-    model.eval()
-    _ = model(torch.zeros((1, 3, imgsz, imgsz), device=device)) if device.type != 'cpu' else None  # run once
-    s = ('%20s' + '%10s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP@0.5', 'F1')
-    p, r, f1, mp, mr, map, mf1, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
-    loss = torch.zeros(3, device=device)
-    stats, ap, ap_class = [], [], []
-    for batch_i, (imgs, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
-        imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
-        targets = targets.to(device)
-        nb, _, height, width = imgs.shape  # batch size, channels, height, width
-        whwh = torch.Tensor([width, height, width, height]).to(device)
+    # Initialize model
+    model = Darknet(cfg).to(device)
 
-        # Disable gradients
-        with torch.no_grad():
-            # Run model
-            t = torch_utils.time_synchronized()
-            inf_out, train_out = model(imgs)  # inference and training outputs
-            t0 += torch_utils.time_synchronized() - t
-
-            # Compute loss
-            if is_training:  # if model has loss hyperparameters
-                loss += compute_loss(train_out, targets, model)[1][:3]  # GIoU, obj, cls
-
-            # Run NMS
-            t = torch_utils.time_synchronized()
-            output = non_max_sup(inf_out, conf_thres=conf_thres, iou_thres=iou_thres, multi_label=multi_label)
-            t1 += torch_utils.time_synchronized() - t
-
-        # Statistics per image
-        for si, pred in enumerate(output):
-            labels = targets[targets[:, 0] == si, 1:]
-            nl = len(labels)
-            tcls = labels[:, 0].tolist() if nl else []  # target class
-            seen += 1
-
-            if pred is None:
-                if nl:
-                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
-                continue
-
-            # Clip boxes to image bounds
-            clip_coords(pred, (height, width))
-
-            # Assign all predictions as incorrect
-            correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
-            if nl:
-                detected = []  # target indices
-                tcls_tensor = labels[:, 0]
-
-                # target boxes
-                tbox = xywh2xyxy(labels[:, 1:5]) * whwh
-
-                # Per target class
-                for cls in torch.unique(tcls_tensor):
-                    ti = (cls == tcls_tensor).nonzero().view(-1)  # prediction indices
-                    pi = (cls == pred[:, 5]).nonzero().view(-1)  # target indices
-
-                    # Search for detections
-                    if pi.shape[0]:
-                        # Prediction to target ious
-                        ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
-
-                        # Append detections
-                        for j in (ious > iouv[0]).nonzero():
-                            d = ti[i[j]]  # detected target
-                            if d not in detected:
-                                detected.append(d)
-                                correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
-                                if len(detected) == nl:  # all targets already located in image
-                                    break
-
-            # Append statistics (correct, conf, pcls, tcls)
-            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
-
-        # Plot images
-        if batch_i < 1:
-            f = 'test_batch%g_gt.jpg' % batch_i  # filename
-            plot_images(imgs, targets, paths=paths, names=names, fname=f)  # ground truth
-            f = 'test_batch%g_pred.jpg' % batch_i
-            plot_images(imgs, output_to_target(output, width, height), paths=paths, names=names, fname=f)  # predictions
-
-    # Compute statistics
-    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
-    if len(stats):
-        p, r, ap, f1, ap_class = ap_per_class(*stats)
-        if niou > 1:
-            p, r, ap, f1 = p[:, 0], r[:, 0], ap.mean(1), ap[:, 0]  # [P, R, AP@0.5:0.95, AP@0.5]
-        mp, mr, map, mf1 = p.mean(), r.mean(), ap.mean(), f1.mean()
-        nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
+    # Optimizer
+    pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
+    for k, v in dict(model.named_parameters()).items():
+        if '.bias' in k:
+            pg2 += [v]  # biases
+        elif 'Conv2d.weight' in k:
+            pg1 += [v]  # apply weight_decay
+        else:
+            pg0 += [v]  # all else
+    if opt.adam:
+        optimizer = optim.Adam(pg0, lr=hyp['lr'])
     else:
-        nt = torch.zeros(1)
+        optimizer = optim.SGD(pg0, lr=hyp['lr'], momentum=hyp['momentum'], nesterov=True)
+    optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
+    optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
+    print('Optimizer groups: %g .bias, %g Conv2d.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
+    del pg0, pg1, pg2
 
-    # Print results
-    pf = '%20s' + '%10.3g' * 6  # print format
-    print(pf % ('all', seen, nt.sum(), mp, mr, map, mf1))
+    start_epoch = 0
+    best_fitness = 0.0
+    if weights.endswith('.pt'):  # pytorch format
+        # possible weights are '*.pt', 'yolov3-spp.pt', 'yolov3-tiny.pt' etc.
+        ckpt = torch.load(weights, map_location=device)
 
-    # Return results
-    maps = np.zeros(nc) + map
-    for i, c in enumerate(ap_class):
-        maps[c] = ap[i]
-    return (mp, mr, map, mf1, *(loss.cpu() / len(dataloader)).tolist()), maps
+        # load model
+        try:
+            # numel()函数：返回数组中元素的个数
+            ckpt['model'] = {k: v for k, v in ckpt['model'].items() if model.state_dict()[k].numel() == v.numel()}
+            model.load_state_dict(ckpt['model'], strict=False)
+        except KeyError as e:
+            s = "%s is not compatible with %s. Specify --weights '' or specify a --cfg compatible with %s. "  \
+                % (opt.weights, opt.cfg, opt.weights)
+            raise KeyError(s) from e
+
+        # load optimizer
+        if ckpt['optimizer'] is not None:
+            optimizer.load_state_dict(ckpt['optimizer'])
+            best_fitness = ckpt['best_fitness']
+
+        # load results
+        if ckpt.get('training_results') is not None:
+            with open(results_file, 'w') as file:
+                file.write(ckpt['training_results'])  # write results.txt
+
+        # epochs
+        start_epoch = ckpt['epoch'] + 1
+        if epochs < start_epoch:
+            print('%s has been trained for %g epochs. Fine-tuning for %g additional epochs.' %
+                  (opt.weights, ckpt['epoch'], epochs))
+            epochs += ckpt['epoch']  # finetune additional epochs
+        del ckpt
+
+    elif len(weights) > 0:  # darknet format
+        # possible weights are '*.weights'
+        load_darknet_weights(model, weights)
+
+    if opt.freeze_layers:
+        # isinstance()函数判断一个对象是否是一个已知的类型
+        output_layer_indices = [idx - 1 for idx, module in enumerate(model.module_list) if isinstance(module, YOLOLayer)]                                                                                                                      
+        freeze_layer_indices = [x for x in range(len(model.module_list)) if                                                                                                         
+                                (x not in output_layer_indices) and                                                                                                               
+                                (x - 1 not in output_layer_indices)]
+        for idx in freeze_layer_indices:                                                                                                                                             
+            for parameter in model.module_list[idx].parameters():                                                                                                                    
+                parameter.requires_grad_(False)  # 输出层不更新梯度
+
+    # Mixed precision training
+    if mixed_precision:
+        model, optimizer = amp.initialize(model, optimizer, opt_level='O1', verbosity=0)
+
+    # Learning rate setup
+    def adjust_learning_rate(optimizer, epoch, iteration, burn_in):
+        """调整学习率进行warm up和学习率衰减
+        """
+        learning_rate = hyp['lr']
+        if iteration < burn_in:
+            # warm up
+            learning_rate = 1e-6 + learning_rate * pow(iteration / burn_in, 2)
+        else:
+            if epoch > opt.epochs * 0.7:
+                learning_rate = learning_rate * 0.1
+            if epoch > opt.epochs * 0.9:
+                learning_rate = learning_rate * 0.1
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = learning_rate
+        return learning_rate
+
+    dataset = LoadImagesAndLabels(train_path, img_size, batch_size,
+                                  augment=True,
+                                  hyp=hyp,  # augmentation hyperparameters
+                                  rect=opt.rect,  # rectangular training
+                                  cache_images=opt.cache_images,
+                                  )
+    # Dataloader
+    batch_size = min(batch_size, len(dataset))
+    nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])  # number of workers
+    dataloader = torch.utils.data.DataLoader(dataset,
+                                             batch_size=batch_size,
+                                             num_workers=nw,
+                                             shuffle=not opt.rect,  # Shuffle=True unless rectangular training is used
+                                             pin_memory=True,
+                                             collate_fn=dataset.collate_fn)
+
+    # Testloader
+    testloader = torch.utils.data.DataLoader(LoadImagesAndLabels(test_path, imgsz_test, batch_size,
+                                                                 hyp=hyp,
+                                                                 rect=True,
+                                                                 cache_images=opt.cache_images,
+                                                                 ),
+                                             batch_size=batch_size,
+                                             num_workers=nw,
+                                             pin_memory=True,
+                                             collate_fn=dataset.collate_fn)
+
+    # Model parameters
+    model.nc = nc  # 类别数
+    model.hyp = hyp  # 超参数
+    # Model EMA
+    ema = torch_utils.ModelEMA(model)  # EMA 指数移动平均,对模型的参数做平均,提高测试指标并增加模型鲁棒
+
+    # Start training
+    nb = len(dataloader)  # number of batches
+    n_burn = max(3 * nb, 500)  # burn-in iterations, max(3 epochs, 500 iterations)
+    maps = np.zeros(nc)  # mAP per class
+    results = (0, 0, 0, 0, 0, 0, 0)  # 'P', 'R', 'mAP', 'F1', 'val GIoU', 'val Objectness', 'val Classification'
+    t0 = time.time()
+
+    print('Using %g dataloader workers' % nw)
+    print('Starting training for %g epochs...' % epochs)
+    print('-----------------------------------------------------------------------------------')
+    for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        model.train()
+        mloss = torch.zeros(4).to(device)  # mean losses
+        print(('%10s' * 8) % ('Epoch', 'gpu_mem', 'GIoU', 'obj', 'cls', 'total', 'targets', 'img_size'))
+        pbar = tqdm(enumerate(dataloader), total=nb)  # progress bar
+        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+            ni = i + nb * epoch  # number integrated batches (since train start)
+            imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0 归一化
+            targets = targets.to(device)
+
+            # 调整学习率，进行warm up和学习率衰减
+            lr = adjust_learning_rate(optimizer, epoch, ni, n_burn)
+            if i == 0:
+                print('\nlearning rate:', lr)
+
+            # Multi-Scale
+            if opt.multi_scale:
+                if ni / accumulate % 10 == 0:  # adjust img_size (67% - 150%) every 10 batch
+                    img_size = random.randrange(imgsz_min, imgsz_max+ 1) * gs
+                sf = img_size / max(imgs.shape[2:])  # scale factor
+                if sf != 1:
+                    # Math.ceil()  "向上取整", 即小数部分直接舍去, 并向正数部分进1
+                    ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to 32-multiple)
+                    imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)  # 上采样，线性插值
+            # Forward
+            pred = model(imgs)
+            # Loss
+            loss, loss_items = compute_loss(pred, targets, model)
+
+            if not torch.isfinite(loss):
+                print('WARNING: non-finite loss, ending training ', loss_items)
+                return results
+
+            # Backward
+            loss *= batch_size / 64  # scale loss
+            if mixed_precision:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
+
+            # Optimize
+            if ni % accumulate == 0:
+                optimizer.step()
+                optimizer.zero_grad()
+                ema.update(model)
+            # Print
+            mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+            mem = '%.3gG' % (torch.cuda.memory_cached() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
+            s = ('%10s' * 2 + '%10.3g' * 6) % ('%g/%g' % (epoch, epochs - 1), mem, *mloss, len(targets), img_size)
+            pbar.set_description(s)
+            # Plot
+            if ni < 1:
+                f = 'train_batch%g.jpg' % i  # filename
+                plot_images(images=imgs, targets=targets, paths=paths, fname=f)
+            # end batch ------------------------------------------------------------------------------------------------
+
+        # Process epoch results
+        ema.update_attr(model)
+        final_epoch = epoch + 1 == epochs
+        if not opt.notest or final_epoch:  # Calculate mAP
+            results, maps = test.test(cfg,
+                                      data,
+                                      batch_size=batch_size,
+                                      imgsz=imgsz_test,
+                                      model=ema.ema,
+                                      dataloader=testloader,
+                                      multi_label=ni > n_burn)
+
+        # Write
+        with open(results_file, 'a') as f:
+            f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
+        if len(opt.name) and opt.bucket:
+            os.system('gsutil cp results.txt gs://%s/results/results%s.txt' % (opt.bucket, opt.name))
+
+        # Update best mAP
+        fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
+        if fi > best_fitness:
+            best_fitness = fi
+
+        # Save model
+        save = (not opt.nosave) or (final_epoch and not opt.evolve)
+        if save:
+            with open(results_file, 'r') as f:  # create checkpoint
+                ckpt = {'epoch': epoch,
+                         'best_fitness': best_fitness,
+                         'training_results': f.read(),
+                         'model': ema.ema.module.state_dict() if hasattr(model, 'module') else ema.ema.state_dict(),
+                         'optimizer': None if final_epoch else optimizer.state_dict()}
+            # Save last, best and delete
+            torch.save(ckpt, last)
+            if (best_fitness == fi) and not final_epoch:
+                torch.save(ckpt, best)
+            del ckpt
+        # end epoch ----------------------------------------------------------------------------------------------------
+    # end training
+
+    n = opt.name
+    if len(opt.name):
+        n = '_' + n if not n.isnumeric() else n
+        fresults, flast, fbest = 'results%s.txt' % n, wdir + 'last%s.pt' % n, wdir + 'best%s.pt' % n
+        for f1, f2 in zip([wdir + 'last.pt', wdir + 'best.pt', 'results.txt'], [flast, fbest, fresults]):
+            if os.path.exists(f1):
+                os.rename(f1, f2)  # rename
+                ispt = f2.endswith('.pt')  # is *.pt
+                strip_optimizer(f2) if ispt else None  # strip optimizer
+                os.system('gsutil cp %s gs://%s/weights' % (f2, opt.bucket)) if opt.bucket and ispt else None  # upload
+
+    plot_results(cls=nc)  # save as results.png
+    print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
+    dist.destroy_process_group() if torch.cuda.device_count() > 1 else None
+    torch.cuda.empty_cache()
+    return results
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(prog='test.py')
-    parser.add_argument('--cfg', type=str, default='data/yolov3-dc.cfg', help='*.cfg path')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch-size', type=int, default=16)  # effective bs = batch_size * accumulate = 16 * 4 = 64
+    parser.add_argument('--cfg', type=str, default='data/yolov3.cfg', help='*.cfg path')
+    parser.add_argument('--weights', type=str, default='', help='initial weights path(weights/last.pt)')
     parser.add_argument('--data', type=str, default='data/obj.data', help='*.data path')
-    parser.add_argument('--weights', type=str, default='weights/best.pt', help='weights path')
-    parser.add_argument('--batch-size', type=int, default=8, help='size of each image batch')
-    parser.add_argument('--img-size', type=int, default=416, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
-    parser.add_argument('--task', default='test', help="'test', 'study', 'benchmark'")
-    parser.add_argument('--device', default='0', help='device id (i.e. 0 or 0,1) or cpu')
+    parser.add_argument('--multi-scale', type=bool, default=True, help='adjust (67% - 150%) img_size every 10 batches')
+    parser.add_argument('--img_size', type=int, default=416, help='inference size (pixels)')
+    parser.add_argument('--rect', action='store_true', help='rectangular training')
+    parser.add_argument('--resume', action='store_true', help='resume training from last.pt')
+    parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
+    parser.add_argument('--notest', action='store_true', help='only test final epoch')
+    parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
+    parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
+    parser.add_argument('--name', default='', help='renames results.txt to results_name.txt if supplied')
+    parser.add_argument('--device', default='0', help='device id (i.e. 0 or 0,1 or cpu)')
+    parser.add_argument('--adam', action='store_true', help='use adam optimizer')
+    parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
+    parser.add_argument('--freeze-layers', action='store_true', help='Freeze non-output layers')
     opt = parser.parse_args()
+
+    opt.weights = last if opt.resume and not opt.weights else opt.weights
     opt.cfg = check_file(opt.cfg)  # check file
     opt.data = check_file(opt.data)  # check file
-    print(opt)
-    test(opt.cfg,
-        opt.data,
-        opt.weights,
-        opt.batch_size,
-        opt.img_size,
-        opt.conf_thres,
-        opt.iou_thres)
+    # 加载gpu
+    device = torch_utils.select_device(opt.device, apex=mixed_precision)
+    if device.type == 'cpu':
+        mixed_precision = False
+    train(hyp)  # train normally
