@@ -273,8 +273,6 @@ def train(hyp):
         # Write
         with open(results_file, 'a') as f:
             f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
-        if len(opt.name) and opt.bucket:
-            os.system('gsutil cp results.txt gs://%s/results/results%s.txt' % (opt.bucket, opt.name))
 
         # Update best mAP
         fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
@@ -282,8 +280,7 @@ def train(hyp):
             best_fitness = fi
 
         # Save model
-        save = (not opt.nosave) or (final_epoch and not opt.evolve)
-        if save:
+        save = (not opt.nosave) or final_epoch
             with open(results_file, 'r') as f:  # create checkpoint
                 ckpt = {'epoch': epoch,
                          'best_fitness': best_fitness,
@@ -297,17 +294,6 @@ def train(hyp):
             del ckpt
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training
-
-    n = opt.name
-    if len(opt.name):
-        n = '_' + n if not n.isnumeric() else n
-        fresults, flast, fbest = 'results%s.txt' % n, wdir + 'last%s.pt' % n, wdir + 'best%s.pt' % n
-        for f1, f2 in zip([wdir + 'last.pt', wdir + 'best.pt', 'results.txt'], [flast, fbest, fresults]):
-            if os.path.exists(f1):
-                os.rename(f1, f2)  # rename
-                ispt = f2.endswith('.pt')  # is *.pt
-                strip_optimizer(f2) if ispt else None  # strip optimizer
-                os.system('gsutil cp %s gs://%s/weights' % (f2, opt.bucket)) if opt.bucket and ispt else None  # upload
 
     plot_results(cls=nc)  # save as results.png
     print('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
@@ -329,7 +315,6 @@ if __name__ == '__main__':
     parser.add_argument('--resume', action='store_true', help='resume training from last.pt')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
     parser.add_argument('--notest', action='store_true', help='only test final epoch')
-    parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
     parser.add_argument('--name', default='', help='renames results.txt to results_name.txt if supplied')
     parser.add_argument('--device', default='0', help='device id (i.e. 0 or 0,1 or cpu)')
