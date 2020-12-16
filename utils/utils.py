@@ -216,17 +216,23 @@ def compute_ap(recall, precision):
     return ap
 
 
-def bbox_iou(box1, box2, GIoU=False, DIoU=False, CIoU=False):
+def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False):
     # Returns the IoU of box1 to box2. box1 is 4, box2 is nx4
     box2 = box2.t()
 
     # Get the coordinates of bounding boxes
-    b1_x1, b1_x2 = box1[0] - box1[2] / 2, box1[0] + box1[2] / 2
-    b1_y1, b1_y2 = box1[1] - box1[3] / 2, box1[1] + box1[3] / 2
-    b2_x1, b2_x2 = box2[0] - box2[2] / 2, box2[0] + box2[2] / 2
-    b2_y1, b2_y2 = box2[1] - box2[3] / 2, box2[1] + box2[3] / 2
+    if x1y1x2y2:
+        # x1, y1, x2, y2 = box1
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1[0], box1[1], box1[2], box1[3]
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2[0], box2[1], box2[2], box2[3]
+    else:
+        # x, y, w, h = box1
+        b1_x1, b1_x2 = box1[0] - box1[2] / 2, box1[0] + box1[2] / 2
+        b1_y1, b1_y2 = box1[1] - box1[3] / 2, box1[1] + box1[3] / 2
+        b2_x1, b2_x2 = box2[0] - box2[2] / 2, box2[0] + box2[2] / 2
+        b2_y1, b2_y2 = box2[1] - box2[3] / 2, box2[1] + box2[3] / 2
 
-    # Intersection area
+        # Intersection area
     inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
             (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
 
@@ -288,35 +294,6 @@ def wh_iou(wh1, wh2):
     inter = torch.min(wh1, wh2).prod(2)  # [N,M]
     return inter / (wh1.prod(2) + wh2.prod(2) - inter)  # iou = inter / (area1 + area2 - inter)
 
-class GHMC_loss(nn.Module):
-    def __init__(self, ghm, bins=10, reduction='mean'):
-        super(GHMC_loss, self).__init__()
-        self.bins = bins
-        self.edges = [float(x) / bins for x in range(bins + 1)]
-        self.edges[-1] += 1e-6
-        self.ghm = ghm
-        self.reduction = reduction
-
-    def forward(self, pred, target):
-        target = target.float()
-        edges = self.edges
-        weights = torch.zeros_like(pred)
-        # 计算梯度模长
-        g = torch.abs(torch.sigmoid(pred)- target)
-        total = 1
-        for k in pred.size():  # b*a*gi*gj
-            total *= k
-        # 通过循环计算落入10个bins的梯度模长数量
-        for i in range(self.bins):
-            inds = (g >= edges[i]) & (g <= edges[i + 1])
-            num_in_bins = inds.sum().item()
-            if num_in_bins > 0:
-                weights[inds] = self.ghm * (total / num_in_bins)
-        weights = weights / 10
-        loss = F.binary_cross_entropy_with_logits(pred, target, weight=weights,reduction=self.reduction)
-        return loss
-
-
 class FocalLoss(nn.Module):
     # Wraps focal loss around existing loss_fcn(), i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=1.5)
     def __init__(self, loss_fcn, gamma=1.5, alpha=0.25):
@@ -363,15 +340,11 @@ def compute_loss(p, targets, model):  # predictions, targets, model
     BCEobj = nn.BCEWithLogitsLoss(pos_weight=ft([h['obj_pw']]), reduction=red)
 
     # class label smoothing 用于多类问题
-    cp, cn = smooth_BCE(eps=0.0)  # 单类问题, cp=1 ,cn=0
+    cp, cn = smooth_BCE(eps=0.1)  # 单类问题, cp=1 ,cn=0
 
-    g = h['ghm']
+    g = h['fl_gamma']  # focal loss gamma
     if g > 0:
-        BCEobj = GHMC_loss(ghm=g, reduction=red)
-    else:
-        g = h['fl_gamma']  # focal loss gamma
-        if g > 0:
-             BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
+        BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
 
 
     # per output
@@ -389,15 +362,14 @@ def compute_loss(p, targets, model):  # predictions, targets, model
             # 防止溢出进行clamp操作,用feature map size乘以feature map对应的anchor
             pwh = ps[:, 2:4].exp().clamp(max=1E3) * anchors[i]
             pbox = torch.cat((pxy, pwh), 1)  # predicted box
-            giou = bbox_iou(pbox.t(), tbox[i], GIoU=True)  # giou(prediction, target)
+            giou = bbox_iou(pbox.t(), tbox[i], x1y1x2y2=False, GIoU=True)  # giou(prediction, target)
             lbox += (1.0 - giou).sum() if red == 'sum' else (1.0 - giou).mean()  # giou loss
             # Obj
             tobj[b, a, gj, gi] = giou.detach().clamp(0).type(tobj.dtype)  # giou ratio
             # Class
-            if model.nc > 1:  # cls loss (only if multiple classes)
-                t = torch.full_like(ps[:, 5:], cn)  # targets
-                t[range(nb), tcls[i]] = cp
-                lcls += BCEcls(ps[:, 5:], t)  # BCE
+            t = torch.full_like(ps[:, 5:], cn)  # targets
+            t[range(nb), tcls[i]] = cp
+            lcls += BCEcls(ps[:, 5:], t)  # BCE
         lobj += BCEobj(pi[..., 4], tobj)  # obj loss
 
     lbox *= h['giou']
@@ -777,8 +749,8 @@ def plot_wh_methods():  # from utils.utils import *; plot_wh_methods()
     fig.savefig('comparison.png', dpi=200)
 
 
-def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max_size=640, max_subplots=16):
-    tl = 3  # line thickness
+def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max_size=1280, max_subplots=16):
+    tl = 2  # line thickness
     tf = max(tl - 1, 1)  # font thickness
     if os.path.isfile(fname):  # do not overwrite
         return None
@@ -840,7 +812,8 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
                 color = color_lut[cls % len(color_lut)]
                 cls = names[cls] if names else cls
                 if gt or conf[j] > 0.5:  # 0.3 conf thresh
-                    label = '%s' % cls if gt else '%s %.1f' % (cls, conf[j])
+                    #label = '%s' % cls if gt else '%s %.1f' % (cls, conf[j])
+                    label = '%s' % cls if gt else '%.1f' % conf[j]
                     plot_one_box(box, mosaic, label=label, color=color, line_thickness=tl)
 
         # Draw image filename labels
@@ -995,7 +968,7 @@ def plot_results(cls=0, start=0, stop=0):  # from utils.utils import *; plot_res
         fig, ax = plt.subplots(2, 5, figsize=(14, 6), tight_layout=True)
         ax = ax.ravel()
         s = ['GIoU', 'Objectness', 'Classification', 'Precision', 'Recall',
-             'val GIoU', 'val Objectness', 'val Classification', 'mAP@0.5', 'F1']
+             'val GIoU', 'val Objectness', 'val Classification', 'mAP', 'F1']
         for f in sorted(files):
             try:
                 results = np.loadtxt(f, usecols=[2, 3, 4, 8, 9, 12, 13, 14, 10, 11], ndmin=2).T
